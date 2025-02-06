@@ -18,26 +18,29 @@
 #![no_std]
 #![no_main]
 
-use core::str::FromStr;
+extern crate alloc;
+
 use include_gif::include_gif;
 use ledger_device_sdk::io::{ApduHeader, Comm, Event, Reply, StatusWords};
 use ledger_device_sdk::ui::{
-    bitmaps::{Glyph, BACK, CERTIFICATE, DASHBOARD_X},
-    gadgets::{EventOrPageIndex, MultiPageMenu, Page},
+    bagls::CHECKMARK_ICON,
+    bitmaps::Glyph,
+    gadgets::clear_screen,
+    layout::{Draw, Layout, Location, StringPlace},
+    SCREEN_HEIGHT, SCREEN_WIDTH,
 };
-
-#[cfg(feature = "pending_review_screen")]
-#[cfg(not(any(target_os = "stax", target_os = "flex")))]
-use ledger_device_sdk::ui::gadgets::display_pending_review;
+use ledger_device_sdk::uxapp::{BOLOS_UX_CONTINUE, BOLOS_UX_IGNORE};
+use ledger_secure_sdk_sys::seph as sys_seph;
+use ledger_secure_sdk_sys::*;
 
 ledger_device_sdk::set_panic!(ledger_device_sdk::exiting_panic);
 
-// Required for using String, Vec, format!...
-extern crate alloc;
+const ICON_PIXEL_SIZE: usize = 14;
+const ICON_MIDDLE: usize = (SCREEN_HEIGHT - ICON_PIXEL_SIZE) / 2;
+const ICON_CENTERED: i16 = ((SCREEN_WIDTH - ICON_PIXEL_SIZE) / 2) as i16;
 
-// Application status words.
 #[repr(u16)]
-#[derive(Clone, Copy, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub enum AppSW {
     Deny = 0x6985,
     WrongP1P2 = 0x6A86,
@@ -78,31 +81,23 @@ impl TryFrom<ApduHeader> for Instruction {
 
 #[no_mangle]
 extern "C" fn sample_main() {
-    // Create the communication manager, and configure it to accept only APDU from the 0xe0 class.
-    // If any APDU with a wrong class value is received, comm will respond automatically with
-    // BadCla status word.
     let mut comm = Comm::new().set_expected_cla(0xe0);
 
-    #[cfg(feature = "pending_review_screen")]
-    display_pending_review(&mut comm);
+    display_top();
 
     loop {
-        let ins = if let Event::Command(ins) = ui_menu_main(&mut comm) {
-            ins
-        } else {
-            continue;
-        };
-
-        let _status = match handle_apdu(&mut comm, &ins) {
-            Ok(()) => {
-                comm.reply_ok();
-                AppSW::Ok
-            }
-            Err(sw) => {
-                comm.reply(sw);
-                sw
-            }
-        };
+        let event = comm.next_event::<ApduHeader>();
+        match event {
+            Event::Command(ins) => match handle_apdu(&mut comm, &ins.try_into().unwrap()) {
+                Ok(()) => {
+                    comm.reply_ok();
+                }
+                Err(sw) => {
+                    comm.reply(sw);
+                }
+            },
+            _ => {}
+        }
     }
 }
 
@@ -112,56 +107,116 @@ fn handle_apdu(comm: &mut Comm, ins: &Instruction) -> Result<(), AppSW> {
     }
 }
 
-pub fn handler_get_version(comm: &mut Comm) -> Result<(), AppSW> {
-    if let Some((major, minor, patch)) = parse_version_string(env!("CARGO_PKG_VERSION")) {
-        comm.append(&[major, minor, patch]);
-        Ok(())
-    } else {
-        Err(AppSW::VersionParsingFail)
-    }
-}
-
-fn parse_version_string(input: &str) -> Option<(u8, u8, u8)> {
-    // Split the input string by '.'.
-    // Input should be of the form "major.minor.patch",
-    // where "major", "minor", and "patch" are integers.
-    let mut parts = input.split('.');
-    let major = u8::from_str(parts.next()?).ok()?;
-    let minor = u8::from_str(parts.next()?).ok()?;
-    let patch = u8::from_str(parts.next()?).ok()?;
-    Some((major, minor, patch))
-}
-
-fn ui_about_menu(comm: &mut Comm) -> Event<Instruction> {
-    let pages = [
-        &Page::from((["Rust Boilerplate", "(c) 2023 Ledger"], true)),
-        &Page::from(("Back", &BACK)),
-    ];
-    loop {
-        match MultiPageMenu::new(comm, &pages).show() {
-            EventOrPageIndex::Event(e) => return e,
-            EventOrPageIndex::Index(1) => return ui_menu_main(comm),
-            EventOrPageIndex::Index(_) => (),
-        }
-    }
-}
-
-pub fn ui_menu_main(comm: &mut Comm) -> Event<Instruction> {
+fn display_top() {
+    clear_screen();
     const APP_ICON: Glyph = Glyph::from_include(include_gif!("crab.gif"));
-    let pages = [
-        // The from trait allows to create different styles of pages
-        // without having to use the new() function.
-        &Page::from((["Boilerplate", "is ready"], &APP_ICON)),
-        &Page::from((["Version", env!("CARGO_PKG_VERSION")], true)),
-        &Page::from(("About", &CERTIFICATE)),
-        &Page::from(("Quit", &DASHBOARD_X)),
-    ];
-    loop {
-        match MultiPageMenu::new(comm, &pages).show() {
-            EventOrPageIndex::Event(e) => return e,
-            EventOrPageIndex::Index(2) => return ui_about_menu(comm),
-            EventOrPageIndex::Index(3) => ledger_device_sdk::exit_app(0),
-            EventOrPageIndex::Index(_) => (),
+    APP_ICON.draw(0, 0)
+}
+
+fn handler_get_version(comm: &mut Comm) -> Result<(), AppSW> {
+    clear_screen();
+    let checkmark = CHECKMARK_ICON.set_x(ICON_CENTERED).set_y(8);
+    checkmark.display();
+    "Message Received".place(Location::Custom(ICON_MIDDLE + 8), Layout::Centered, true);
+    wait_ticker::<Instruction>(comm);
+    display_top();
+    Ok(())
+}
+
+fn wait_ticker<T>(comm: &mut Comm)
+where
+    T: TryFrom<ApduHeader>,
+    Reply: From<<T as TryFrom<ApduHeader>>::Error>,
+{
+    let mut elapsed_time = 0;
+    let max_elapsed_time = 2000;
+
+    while elapsed_time < max_elapsed_time {
+        let event = UxEvent::block_and_get_event::<T>(comm);
+
+        match event {
+            Some(Event::Ticker) => {
+                elapsed_time += 100;
+            }
+            _ => {}
         }
+        if elapsed_time > max_elapsed_time {
+            break;
+        }
+    }
+}
+
+fn os_ux_rs(params: &bolos_ux_params_t) {
+    unsafe { os_ux(params as *const bolos_ux_params_t as *mut bolos_ux_params_t) };
+}
+
+#[repr(u8)]
+pub enum UxEvent {
+    Event = BOLOS_UX_EVENT,
+    Keyboard = BOLOS_UX_KEYBOARD,
+    WakeUp = BOLOS_UX_WAKE_UP,
+    ValidatePIN = BOLOS_UX_VALIDATE_PIN,
+    LastID = BOLOS_UX_LAST_ID,
+}
+
+impl UxEvent {
+    pub fn request(&self) -> u32 {
+        let mut params = bolos_ux_params_t::default();
+        params.ux_id = match self {
+            Self::Event => Self::Event as u8,
+            Self::Keyboard => Self::Keyboard as u8,
+            Self::WakeUp => Self::WakeUp as u8,
+            Self::ValidatePIN => {
+                // Perform pre-wake up
+                params.ux_id = Self::WakeUp as u8;
+                os_ux_rs(&params);
+
+                Self::ValidatePIN as u8
+            }
+            Self::LastID => Self::LastID as u8,
+        };
+
+        os_ux_rs(&params);
+
+        match self {
+            Self::ValidatePIN => Self::block(),
+            _ => unsafe { os_sched_last_status(TASK_BOLOS_UX as u32) as u32 },
+        }
+    }
+
+    pub fn block() -> u32 {
+        let mut ret = unsafe { os_sched_last_status(TASK_BOLOS_UX as u32) } as u32;
+        while ret == BOLOS_UX_IGNORE || ret == BOLOS_UX_CONTINUE {
+            if unsafe { os_sched_is_running(TASK_SUBTASKS_START as u32) }
+                != BOLOS_TRUE.try_into().unwrap()
+            {
+                let mut spi_buffer = [0u8; 256];
+                sys_seph::send_general_status();
+                sys_seph::seph_recv(&mut spi_buffer, 0);
+                UxEvent::Event.request();
+            } else {
+                unsafe { os_sched_yield(BOLOS_UX_OK as u8) };
+            }
+            ret = unsafe { os_sched_last_status(TASK_BOLOS_UX as u32) } as u32;
+        }
+        ret
+    }
+
+    pub fn block_and_get_event<T>(comm: &mut Comm) -> Option<Event<T>>
+    where
+        T: TryFrom<ApduHeader>,
+        Reply: From<<T as TryFrom<ApduHeader>>::Error>,
+    {
+        let mut spi_buffer = [0u8; 256];
+        seph::send_general_status();
+        seph::seph_recv(&mut spi_buffer, 0);
+        let event = comm.decode_event(&mut spi_buffer);
+
+        UxEvent::Event.request();
+
+        if let Option::Some(Event::Ticker) = event {
+            return event;
+        }
+        event
     }
 }

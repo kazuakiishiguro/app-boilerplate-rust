@@ -25,10 +25,7 @@ class P2(IntEnum):
     P2_MORE = 0x80
 
 class InsType(IntEnum):
-    GET_VERSION    = 0x03
-    GET_APP_NAME   = 0x04
-    GET_PUBLIC_KEY = 0x05
-    SIGN_TX        = 0x06
+    SHOW_MESSAGE    = 0x03
 
 class Errors(IntEnum):
     SW_DENY                    = 0x6985
@@ -64,9 +61,9 @@ class BoilerplateCommandSender:
                                      data=b"")
 
 
-    def get_version(self) -> RAPDU:
+    def show_message(self) -> RAPDU:
         return self.backend.exchange(cla=CLA,
-                                     ins=InsType.GET_VERSION,
+                                     ins=InsType.SHOW_MESSAGE,
                                      p1=P1.P1_START,
                                      p2=P2.P2_LAST,
                                      data=b"")
