@@ -18,50 +18,22 @@
 #![no_std]
 #![no_main]
 
-mod utils;
-mod app_ui {
-    pub mod address;
-    pub mod menu;
-    pub mod sign;
-}
-mod handlers {
-    pub mod get_public_key;
-    pub mod get_version;
-    pub mod sign_tx;
-}
-
-mod settings;
-
-use app_ui::menu::ui_menu_main;
-use handlers::{
-    get_public_key::handler_get_public_key,
-    get_version::handler_get_version,
-    sign_tx::{handler_sign_tx, TxContext},
+use core::str::FromStr;
+use include_gif::include_gif;
+use ledger_device_sdk::io::{ApduHeader, Comm, Event, Reply, StatusWords};
+use ledger_device_sdk::ui::{
+    bitmaps::{Glyph, BACK, CERTIFICATE, DASHBOARD_X},
+    gadgets::{EventOrPageIndex, MultiPageMenu, Page},
 };
-use ledger_device_sdk::io::{ApduHeader, Comm, Reply, StatusWords};
+
 #[cfg(feature = "pending_review_screen")]
 #[cfg(not(any(target_os = "stax", target_os = "flex")))]
 use ledger_device_sdk::ui::gadgets::display_pending_review;
-
-#[cfg(not(any(target_os = "stax", target_os = "flex")))]
-use ledger_device_sdk::io::Event;
 
 ledger_device_sdk::set_panic!(ledger_device_sdk::exiting_panic);
 
 // Required for using String, Vec, format!...
 extern crate alloc;
-
-#[cfg(any(target_os = "stax", target_os = "flex"))]
-use ledger_device_sdk::nbgl::{init_comm, NbglReviewStatus, StatusType};
-
-// P2 for last APDU to receive.
-const P2_SIGN_TX_LAST: u8 = 0x00;
-// P2 for more APDU to receive.
-const P2_SIGN_TX_MORE: u8 = 0x80;
-// P1 for first APDU number.
-const P1_SIGN_TX_START: u8 = 0x00;
-// P1 for maximum APDU number.
-const P1_SIGN_TX_MAX: u8 = 0x03;
 
 // Application status words.
 #[repr(u16)]
@@ -92,65 +64,15 @@ impl From<AppSW> for Reply {
 /// Possible input commands received through APDUs.
 pub enum Instruction {
     GetVersion,
-    GetAppName,
-    GetPubkey { display: bool },
-    SignTx { chunk: u8, more: bool },
 }
 
 impl TryFrom<ApduHeader> for Instruction {
     type Error = AppSW;
-
-    /// APDU parsing logic.
-    ///
-    /// Parses INS, P1 and P2 bytes to build an [`Instruction`]. P1 and P2 are translated to
-    /// strongly typed variables depending on the APDU instruction code. Invalid INS, P1 or P2
-    /// values result in errors with a status word, which are automatically sent to the host by the
-    /// SDK.
-    ///
-    /// This design allows a clear separation of the APDU parsing logic and commands handling.
-    ///
-    /// Note that CLA is not checked here. Instead the method [`Comm::set_expected_cla`] is used in
-    /// [`sample_main`] to have this verification automatically performed by the SDK.
     fn try_from(value: ApduHeader) -> Result<Self, Self::Error> {
         match (value.ins, value.p1, value.p2) {
             (3, 0, 0) => Ok(Instruction::GetVersion),
-            (4, 0, 0) => Ok(Instruction::GetAppName),
-            (5, 0 | 1, 0) => Ok(Instruction::GetPubkey {
-                display: value.p1 != 0,
-            }),
-            (6, P1_SIGN_TX_START, P2_SIGN_TX_MORE)
-            | (6, 1..=P1_SIGN_TX_MAX, P2_SIGN_TX_LAST | P2_SIGN_TX_MORE) => {
-                Ok(Instruction::SignTx {
-                    chunk: value.p1,
-                    more: value.p2 == P2_SIGN_TX_MORE,
-                })
-            }
-            (3..=6, _, _) => Err(AppSW::WrongP1P2),
             (_, _, _) => Err(AppSW::InsNotSupported),
         }
-    }
-}
-
-#[cfg(any(target_os = "stax", target_os = "flex"))]
-fn show_status_and_home_if_needed(ins: &Instruction, tx_ctx: &mut TxContext, status: &AppSW) {
-    let (show_status, status_type) = match (ins, status) {
-        (Instruction::GetPubkey { display: true }, AppSW::Deny | AppSW::Ok) => {
-            (true, StatusType::Address)
-        }
-        (Instruction::SignTx { .. }, AppSW::Deny | AppSW::Ok) if tx_ctx.finished() => {
-            (true, StatusType::Transaction)
-        }
-        (_, _) => (false, StatusType::Transaction),
-    };
-
-    if show_status {
-        let success = *status == AppSW::Ok;
-        NbglReviewStatus::new()
-            .status_type(status_type)
-            .show(success);
-
-        // call home.show_and_return() to show home and setting screen
-        tx_ctx.home.show_and_return();
     }
 }
 
@@ -161,33 +83,17 @@ extern "C" fn sample_main() {
     // BadCla status word.
     let mut comm = Comm::new().set_expected_cla(0xe0);
 
-    let mut tx_ctx = TxContext::new();
-
-    #[cfg(any(target_os = "stax", target_os = "flex"))]
-    {
-        // Initialize reference to Comm instance for NBGL
-        // API calls.
-        init_comm(&mut comm);
-        tx_ctx.home = ui_menu_main(&mut comm);
-        tx_ctx.home.show_and_return();
-    }
-
-    #[cfg(not(any(target_os = "stax", target_os = "flex")))]
     #[cfg(feature = "pending_review_screen")]
     display_pending_review(&mut comm);
 
     loop {
-        #[cfg(any(target_os = "stax", target_os = "flex"))]
-        let ins: Instruction = comm.next_command();
-
-        #[cfg(not(any(target_os = "stax", target_os = "flex")))]
         let ins = if let Event::Command(ins) = ui_menu_main(&mut comm) {
             ins
         } else {
             continue;
         };
 
-        let _status = match handle_apdu(&mut comm, &ins, &mut tx_ctx) {
+        let _status = match handle_apdu(&mut comm, &ins) {
             Ok(()) => {
                 comm.reply_ok();
                 AppSW::Ok
@@ -197,19 +103,65 @@ extern "C" fn sample_main() {
                 sw
             }
         };
-        #[cfg(any(target_os = "stax", target_os = "flex"))]
-        show_status_and_home_if_needed(&ins, &mut tx_ctx, &_status);
     }
 }
 
-fn handle_apdu(comm: &mut Comm, ins: &Instruction, ctx: &mut TxContext) -> Result<(), AppSW> {
+fn handle_apdu(comm: &mut Comm, ins: &Instruction) -> Result<(), AppSW> {
     match ins {
-        Instruction::GetAppName => {
-            comm.append(env!("CARGO_PKG_NAME").as_bytes());
-            Ok(())
-        }
         Instruction::GetVersion => handler_get_version(comm),
-        Instruction::GetPubkey { display } => handler_get_public_key(comm, *display),
-        Instruction::SignTx { chunk, more } => handler_sign_tx(comm, *chunk, *more, ctx),
+    }
+}
+
+pub fn handler_get_version(comm: &mut Comm) -> Result<(), AppSW> {
+    if let Some((major, minor, patch)) = parse_version_string(env!("CARGO_PKG_VERSION")) {
+        comm.append(&[major, minor, patch]);
+        Ok(())
+    } else {
+        Err(AppSW::VersionParsingFail)
+    }
+}
+
+fn parse_version_string(input: &str) -> Option<(u8, u8, u8)> {
+    // Split the input string by '.'.
+    // Input should be of the form "major.minor.patch",
+    // where "major", "minor", and "patch" are integers.
+    let mut parts = input.split('.');
+    let major = u8::from_str(parts.next()?).ok()?;
+    let minor = u8::from_str(parts.next()?).ok()?;
+    let patch = u8::from_str(parts.next()?).ok()?;
+    Some((major, minor, patch))
+}
+
+fn ui_about_menu(comm: &mut Comm) -> Event<Instruction> {
+    let pages = [
+        &Page::from((["Rust Boilerplate", "(c) 2023 Ledger"], true)),
+        &Page::from(("Back", &BACK)),
+    ];
+    loop {
+        match MultiPageMenu::new(comm, &pages).show() {
+            EventOrPageIndex::Event(e) => return e,
+            EventOrPageIndex::Index(1) => return ui_menu_main(comm),
+            EventOrPageIndex::Index(_) => (),
+        }
+    }
+}
+
+pub fn ui_menu_main(comm: &mut Comm) -> Event<Instruction> {
+    const APP_ICON: Glyph = Glyph::from_include(include_gif!("crab.gif"));
+    let pages = [
+        // The from trait allows to create different styles of pages
+        // without having to use the new() function.
+        &Page::from((["Boilerplate", "is ready"], &APP_ICON)),
+        &Page::from((["Version", env!("CARGO_PKG_VERSION")], true)),
+        &Page::from(("About", &CERTIFICATE)),
+        &Page::from(("Quit", &DASHBOARD_X)),
+    ];
+    loop {
+        match MultiPageMenu::new(comm, &pages).show() {
+            EventOrPageIndex::Event(e) => return e,
+            EventOrPageIndex::Index(2) => return ui_about_menu(comm),
+            EventOrPageIndex::Index(3) => ledger_device_sdk::exit_app(0),
+            EventOrPageIndex::Index(_) => (),
+        }
     }
 }
